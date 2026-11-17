@@ -408,6 +408,12 @@ export default function activate(folium) {
                 }
             }
             await folium.storage.set('userProps', next);
+            // 壁纸模式下背景在另一个窗口，通知主进程广播给所有窗口
+            try {
+                await folium.rpc.call('propsChanged', {});
+            } catch (error) {
+                void error;
+            }
         } catch (error) {
             console.warn('[壁纸引擎] 保存壁纸属性失败', error);
         }
@@ -2650,6 +2656,29 @@ export default function activate(folium) {
         render().catch((error) => console.warn('[壁纸引擎] 挂载失败', error));
 
         /*
+         * 壁纸模式下设置面板和背景不在同一个窗口，rpc 广播不一定能到这边窗口。
+         * 轮询属性存储兜底：值变了就强制重挂一次。
+         */
+        let lastPropsJson = '';
+        const propsPoll = setInterval(async () => {
+            try {
+                const stored = await readUserProps();
+                const json = JSON.stringify(stored);
+                if (lastPropsJson === '') {
+                    lastPropsJson = json;
+                } else if (json !== lastPropsJson) {
+                    lastPropsJson = json;
+                    if (!forceRemount) {
+                        forceRemount = true;
+                        scheduleRender();
+                    }
+                }
+            } catch (error) {
+                void error;
+            }
+        }, 1500);
+
+        /*
          * 设置变了、切歌了、播放/暂停了，宿主都会通知。
          * Folium 2 把 ctx.subscribe 改名成 ctx.onChange（旧名会打弃用警告），
          * 这里优先用新名，老宿主上再退回旧名。
@@ -2699,6 +2728,11 @@ export default function activate(folium) {
         return () => {
             disposed = true;
             listeners.delete(onSelectionChange);
+            try {
+                clearInterval(propsPoll);
+            } catch (error) {
+                void error;
+            }
             if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
                 window.removeEventListener('pointermove', onPointerMove);
             }
@@ -3593,6 +3627,16 @@ export default function activate(folium) {
     try {
         folium.rpc.on('ready', () => {
             libraryCache = null;
+        });
+    } catch {
+        /* 非主窗口上下文没有 rpc.on */
+    }
+
+    // 属性面板和背景可能不在同一个窗口（壁纸模式）：收到广播就强制重挂
+    try {
+        folium.rpc.on('propsChanged', () => {
+            forceRemount = true;
+            notify();
         });
     } catch {
         /* 非主窗口上下文没有 rpc.on */

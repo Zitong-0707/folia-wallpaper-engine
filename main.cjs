@@ -1108,7 +1108,16 @@ const startSceneServer = (item) => new Promise((resolve, reject) => {
     server.listen(0, '127.0.0.1', () => {
         const address = server.address();
         const origin = `http://127.0.0.1:${address.port}`;
-        resolve({ server, token, origin, base: `${origin}/${token}`, dir: root });
+        resolve({
+            server,
+            token,
+            origin,
+            base: `${origin}/${token}`,
+            dir: root,
+            setProps: (value) => {
+                currentProps = value && typeof value === 'object' ? value : {};
+            },
+        });
     });
 });
 
@@ -1600,6 +1609,19 @@ module.exports = function activate(api) {
     });
 
     api.rpc.handle('ping', () => ({ ok: true, base }));
+
+    /*
+     * 壁纸模式下背景在独立窗口渲染。属性面板保存后调用这里，由主进程广播给所有窗口，
+     * 让每个窗口里的背景都重挂一次、带上新的属性值。
+     */
+    api.rpc.handle('propsChanged', () => {
+        try {
+            api.rpc.send('propsChanged', {});
+        } catch (error) {
+            void error;
+        }
+        return { ok: true };
+    });
 
     startServer(() => library).then((started) => {
         server = started.server;
