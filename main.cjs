@@ -475,6 +475,267 @@ const sceneArtFor = async (item) => {
     return art;
 };
 
+// ---------------------------------------------------------------------------
+// 壁纸取色：给「壁纸取色主题」用
+// ---------------------------------------------------------------------------
+
+/*
+ * 用 Chromium 自带的解码器（nativeImage）取主色，而不是渲染端 canvas：
+ * 播放页是 file:// 或 app://，壁纸却从临时 HTTP 端口来，canvas 画跨域图会被污染。
+ * nativeImage 在主进程直接解 PNG/JPEG/WebP，缩到 40px 后统计颜色桶即可。
+ */
+let nativeImageRef = null;
+const nativeImageOf = () => {
+    if (nativeImageRef !== null) {
+        return nativeImageRef;
+    }
+    try {
+        const electron = require('electron');
+        nativeImageRef = electron && electron.nativeImage ? electron.nativeImage : false;
+    } catch {
+        nativeImageRef = false;
+    }
+    return nativeImageRef;
+};
+
+const paletteCache = new Map();
+const PALETTE_CACHE_ENTRIES = 300;
+
+const paletteCachePut = (key, value) => {
+    paletteCache.delete(key);
+    paletteCache.set(key, value);
+    while (paletteCache.size > PALETTE_CACHE_ENTRIES) {
+        paletteCache.delete(paletteCache.keys().next().value);
+    }
+};
+
+const rgbToHsl = ([r, g, b]) => {
+    const rn = r / 255;
+    const gn = g / 255;
+    const bn = b / 255;
+    const max = Math.max(rn, gn, bn);
+    const min = Math.min(rn, gn, bn);
+    const l = (max + min) / 2;
+    if (max === min) {
+        return [0, 0, Math.round(l * 100)];
+    }
+    const d = max - min;
+    const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    let h;
+    if (max === rn) {
+        h = (gn - bn) / d + (gn < bn ? 6 : 0);
+    } else if (max === gn) {
+        h = (bn - rn) / d + 2;
+    } else {
+        h = (rn - gn) / d + 4;
+    }
+    return [Math.round(h * 60) % 360 || 0, Math.round(s * 100), Math.round(l * 100)];
+};
+
+// 颜色桶统计：BGRA / RGB 两种字节序共用
+const analyzeRgb = (bytes, bgro) => {
+    const buckets = new Map();
+    for (let index = 0; index + 2 < bytes.length; index += 3) {
+        const r = bgro ? bytes[index + 2] : bytes[index];
+        const g = bytes[index + 1];
+        const b = bgro ? bytes[index] : bytes[index + 2];
+        const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+        if (lum < 0.035 || lum > 0.96) {
+            continue;
+        }
+        const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+        const entry = buckets.get(key) ?? { count: 0, r: 0, g: 0, b: 0 };
+        entry.count += 1;
+        entry.r += r;
+        entry.g += g;
+        entry.b += b;
+        buckets.set(key, entry);
+    }
+    if (buckets.size === 0) {
+        return null;
+    }
+    const entries = [...buckets.values()].sort((a, b) => b.count - a.count);
+    const pick = (entry) => ({
+        r: Math.round(entry.r / entry.count),
+        g: Math.round(entry.g / entry.count),
+        b: Math.round(entry.b / entry.count),
+    });
+    const samples = entries.slice(0, 6).map(pick);
+    let primary = samples[0];
+    let bestScore = -1;
+    for (const color of samples) {
+        const [, s, l] = rgbToHsl([color.r, color.g, color.b]);
+        const score = s * 1.6 + (1 - Math.abs(l - 50) / 50) * 10;
+        if (score > bestScore) {
+            bestScore = score;
+            primary = color;
+        }
+    }
+    const secondary = samples.find((color) => color !== primary) ?? primary;
+    return { primary, secondary };
+};
+
+// 取色主力：Electron nativeImage。取不到时返回 null，交给 ffmpeg 兜底。
+const paletteViaNativeImage = (buffer) => {
+    const nativeImage = nativeImageOf();
+    if (!nativeImage || !buffer || buffer.length === 0) {
+        return null;
+    }
+    let image;
+    try {
+        image = nativeImage.createFromBuffer(buffer);
+    } catch {
+        return null;
+    }
+    if (!image || image.isEmpty()) {
+        return null;
+    }
+    let small;
+    try {
+        small = image.resize({ width: 40, height: 40, quality: 'good' });
+    } catch {
+        small = image;
+    }
+    let bitmap;
+    try {
+        bitmap = small.toBitmap();
+    } catch {
+        return null;
+    }
+    if (!bitmap || bitmap.length < 16) {
+        return null;
+    }
+    const bgra = process.platform !== 'darwin';
+    const palette = analyzeRgb(bitmap.subarray(0, bitmap.length - (bitmap.length % 4)), bgra);
+    return palette;
+};
+
+const ffmpegCandidates = () => {
+    const found = [];
+    const env = process.env.FOLIA_FFMPEG_PATH;
+    if (env && fs.existsSync(env)) {
+        found.push(env);
+    }
+    const resources = process.resourcesPath;
+    if (resources) {
+        for (const name of ['ffmpeg', 'ffmpeg-8.1.2', 'ffmpeg-8.1.2-win64-static']) {
+            const candidate = path.join(resources, name, 'ffmpeg.exe');
+            try {
+                if (fs.existsSync(candidate)) {
+                    found.push(candidate);
+                }
+            } catch {
+                /* 忽略 */
+            }
+        }
+    }
+    found.push('ffmpeg');
+    return found;
+};
+
+// 兜底：让 ffmpeg 把图缩成 40x40 的 rgb24 原始帧，再走同一套颜色桶
+const paletteViaFfmpeg = (filePath) => new Promise((resolve) => {
+    const candidates = ffmpegCandidates();
+    const need = 40 * 40 * 3;
+    const tryNext = (index) => {
+        if (index >= candidates.length) {
+            resolve(null);
+            return;
+        }
+        const args = [
+            '-v', 'error',
+            '-i', filePath,
+            '-vf', 'scale=40:40',
+            '-frames:v', '1',
+            '-f', 'rawvideo',
+            '-pix_fmt', 'rgb24',
+            '-',
+        ];
+        execFile(candidates[index], args, { timeout: 10000, maxBuffer: need + 1024, windowsHide: true }, (error, stdout) => {
+            if (error || !stdout || stdout.length < need) {
+                tryNext(index + 1);
+                return;
+            }
+            resolve(analyzeRgb(stdout.subarray(0, need), false));
+        });
+    };
+    tryNext(0);
+});
+
+const paletteSourcePaths = (item) => {
+    // 视频也收进来：ffmpeg 能直接抽帧，比「没有预览图就取不了色」稳
+    const mediaExt = /\.(png|jpe?g|webp|bmp|gif|mp4|m4v|webm|mov|mkv)$/i;
+    const paths = [];
+    if (item.absFile && mediaExt.test(item.absFile)) {
+        paths.push(item.absFile);
+    }
+    if (item.absPreview && mediaExt.test(item.absPreview)) {
+        paths.push(item.absPreview);
+    }
+    return paths;
+};
+
+const paletteFor = async (item) => {
+    const cached = paletteCache.get(item.id);
+    if (cached) {
+        return cached;
+    }
+    const paths = paletteSourcePaths(item);
+    const imageExt = /\.(png|jpe?g|webp|bmp|gif)$/i;
+    let palette = null;
+    // 1) nativeImage 解码原图 → 预览图 → 场景原画（只喂图片，视频交给 ffmpeg）
+    if (nativeImageOf()) {
+        const sources = [];
+        const imagePaths = paths.filter((filePath) => imageExt.test(filePath));
+        if (imagePaths[0]) {
+            sources.push({ path: imagePaths[0] });
+        }
+        if (item.kind === 'scene') {
+            try {
+                const art = await sceneArtFor(item);
+                if (art && art.body) {
+                    sources.push({ buffer: art.body });
+                }
+            } catch {
+                /* 忽略 */
+            }
+        }
+        if (imagePaths[1]) {
+            sources.push({ path: imagePaths[1] });
+        }
+        for (const source of sources) {
+            try {
+                const buffer = source.buffer ?? await fs.promises.readFile(source.path);
+                palette = paletteViaNativeImage(buffer);
+            } catch {
+                palette = null;
+            }
+            if (palette) {
+                break;
+            }
+        }
+    }
+    // 2) ffmpeg 兜底（图片、视频都能抽一帧）
+    if (!palette) {
+        for (const filePath of paths) {
+            palette = await paletteViaFfmpeg(filePath);
+            if (palette) {
+                break;
+            }
+        }
+    }
+    if (!palette) {
+        return null;
+    }
+    const result = {
+        ...palette,
+        primaryHsl: rgbToHsl([palette.primary.r, palette.primary.g, palette.primary.b]),
+        secondaryHsl: rgbToHsl([palette.secondary.r, palette.secondary.g, palette.secondary.b]),
+    };
+    paletteCachePut(item.id, result);
+    return result;
+};
+
 /**
  * 图层清单：{ frame:{cx,cy,w,h}, layers:[{index,name,cx,cy,w,h,alpha,offset,length,mime}] }
  * 图片字节按需从包里读，清单本身只有几 KB。
@@ -933,6 +1194,15 @@ const SCENE_HOST = `<!doctype html><html><head><meta charset="utf-8">
         if (data.type === 'audio' && data.left && data.right) {
             left.set(data.left);
             right.set(data.right);
+            return;
+        }
+        if (data.type === 'props' && data.props && instance) {
+            // 运行中调属性：不重建 iframe，直接把新属性喂给引擎（重挂会黑一下）
+            try {
+                instance.setProperties(data.props);
+            } catch (error) {
+                post('diag', { level: 'warn', message: 'props: ' + String(error && error.message || error) });
+            }
             return;
         }
         if (data.type === 'media') {
@@ -1452,6 +1722,55 @@ module.exports = function activate(api) {
     };
 
     api.rpc.handle('library', (options) => payload(options && options.refresh === true));
+
+    /*
+     * 取某张壁纸的主色 / 辅色。渲染端拿到后自己换算成 CSS 变量注入。
+     * 结果按 item.id 缓存在主进程，换回同一张壁纸不用重新解码。
+     */
+    api.rpc.handle('themePalette', async (options) => {
+        const id = String(options?.id ?? '');
+        if (!id) {
+            return { ok: false, error: 'bad-id' };
+        }
+        const current = await ensureLibrary(false);
+        const item = current.items.find((entry) => entry.id === id);
+        if (!item) {
+            return { ok: false, error: 'not-found' };
+        }
+        try {
+            const palette = await paletteFor(item);
+            if (!palette) {
+                return { ok: false, error: 'no-image' };
+            }
+            return { ok: true, ...palette };
+        } catch (error) {
+            return { ok: false, error: String(error?.message ?? error) };
+        }
+    });
+
+    /*
+     * 主题写进 localStorage 后，Folia 运行中不会重新读；页面刷新还会被主题编辑器
+     * 用旧值覆盖回去。唯一可靠的方式是重启进程，这里给渲染端一个「重启 Folia」。
+     */
+    api.rpc.handle('relaunchApp', () => {
+        try {
+            const { app } = require('electron');
+            if (!app || typeof app.relaunch !== 'function') {
+                return { ok: false, error: 'no-electron-app' };
+            }
+            setTimeout(() => {
+                try {
+                    app.relaunch();
+                    app.exit(0);
+                } catch {
+                    /* 已经退出 */
+                }
+            }, 500);
+            return { ok: true };
+        } catch (error) {
+            return { ok: false, error: String(error?.message ?? error) };
+        }
+    });
 
     /*
      * 给网页壁纸拿一个属于自己的临时 origin。渲染端只用返回的 url 当 iframe.src，
