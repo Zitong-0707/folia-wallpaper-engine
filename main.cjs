@@ -215,6 +215,78 @@ const readCurrentDesktopWallpaper = async (engineDir) => {
  * scene 壁纸的内容封在 scene.pkg 里，必须 Wallpaper Engine 自己的运行时
  * 才解得开，第三方无法还原 —— 那就老实显示预览图，并在面板里标注。
  */
+/*
+ * WE 壁纸用户属性（`project.json` 的 `general.properties`）→ 面板可用的描述列表。
+ * 语义参照上游 we-props：order 按浮点读、combo 选项保留原始 JSON 类型、
+ * condition 只影响面板显隐不下发过滤；`editable: false` 是作者标记的用户不可编辑，
+ * 这里直接跳过（与 DSH 壁纸插件的裁剪版一致）。
+ */
+/* 属性文案里带 HTML 标签（<big>、<br> 等）是 WE 的常态，面板上要去掉 */
+const stripHtml = (raw) => {
+    if (typeof raw !== 'string' || raw === '') {
+        return '';
+    }
+    return raw
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<[^>]*>/g, '')
+        .replace(/&nbsp;/gi, ' ')
+        .replace(/&amp;/gi, '&')
+        .replace(/&lt;/gi, '<')
+        .replace(/&gt;/gi, '>')
+        .replace(/&quot;/gi, '"')
+        .replace(/&#0?39;|&apos;/gi, "'")
+        .replace(/[ \t]+\n/g, '\n')
+        .trim();
+};
+
+const parseWeProps = (project) => {
+    const props = project && project.general && project.general.properties;
+    if (!props || typeof props !== 'object') {
+        return [];
+    }
+    const out = [];
+    for (const [name, def] of Object.entries(props)) {
+        if (!def || typeof def !== 'object' || typeof def.type !== 'string') {
+            continue;
+        }
+        if (def.editable === false) {
+            continue;
+        }
+        const entry = {
+            name,
+            type: def.type,
+            text: typeof def.text === 'string' && def.text.trim() !== '' ? stripHtml(def.text) : name,
+            order: Number.isFinite(Number(def.order)) ? Number(def.order) : 0,
+        };
+        if ('value' in def) {
+            entry.value = def.value;
+        }
+        if (Array.isArray(def.options)) {
+            const options = def.options
+                .filter((option) => option && typeof option === 'object' && 'value' in option)
+                .map((option) => ({
+                    label: typeof option.label === 'string' ? stripHtml(option.label) : String(option.value),
+                    value: option.value,
+                }));
+            if (options.length) {
+                entry.options = options;
+            }
+        }
+        if (Number.isFinite(Number(def.min))) {
+            entry.min = Number(def.min);
+        }
+        if (Number.isFinite(Number(def.max))) {
+            entry.max = Number(def.max);
+        }
+        if (Number.isFinite(Number(def.step))) {
+            entry.step = Number(def.step);
+        }
+        out.push(entry);
+    }
+    out.sort((a, b) => a.order - b.order || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    return out;
+};
+
 const readWallpaper = async (dir, source, idPrefix) => {
     const project = await readJson(path.join(dir, 'project.json'));
     if (!project || typeof project !== 'object') {
@@ -265,6 +337,8 @@ const readWallpaper = async (dir, source, idPrefix) => {
         absFile: hasFile ? fileAbs : null,
         absPreview: hasPreview ? previewAbs : null,
         tags: Array.isArray(project.tags) ? project.tags.filter((tag) => typeof tag === 'string').slice(0, 6) : [],
+        // 场景壁纸的用户属性定义；video / web 基本没有，返回空数组
+        properties: parseWeProps(project),
     };
 };
 
@@ -802,27 +876,52 @@ const SCENE_HOST = `<!doctype html><html><head><meta charset="utf-8">
             post('error', { message: 'engine not loaded' });
             return;
         }
-        instance = WebWallGL.createScene(document.body, {
-            fit: params.get('fit') === 'contain' ? 'contain' : params.get('fit') === 'fill' ? 'stretch' : 'cover',
-            fps: Math.max(15, Math.min(60, Number(params.get('fps')) || 30)),
-            volume: 0,
-            autoplay: true,
-            scripts: true,
-            onDiagnostic: function (message, level) {
-                post('diag', { level: level, message: String(message) });
-                if (level !== 'error' && /renderer started|renderer:/i.test(String(message))) {
-                    setTimeout(sendReady, 800);
-                }
-            },
-            onError: function (error) {
-                post('error', { message: String(error && error.message || error) });
+        var boot = function (props) {
+            try {
+                instance = WebWallGL.createScene(document.body, {
+                    fit: params.get('fit') === 'contain' ? 'contain' : params.get('fit') === 'fill' ? 'stretch' : 'cover',
+                    fps: Math.max(15, Math.min(60, Number(params.get('fps')) || 30)),
+                    volume: 0,
+                    autoplay: true,
+                    scripts: true,
+                    // 引擎的 __applyOptions 认的是 properties（scriptProperties 只是脚本侧全局名）
+                    properties: props || {},
+                    onDiagnostic: function (message, level) {
+                        post('diag', { level: level, message: String(message) });
+                        if (level !== 'error' && /renderer started|renderer:/i.test(String(message))) {
+                            setTimeout(sendReady, 800);
+                        }
+                    },
+                    onError: function (error) {
+                        post('error', { message: String(error && error.message || error) });
+                    }
+                });
+            } catch (error) {
+                post('error', { message: 'create: ' + String(error && error.message || error) });
+                return;
             }
-        });
-        instance.setAudio({ snapshot: function () { return { left: left, right: right }; } });
-        instance.load(WebWallGL.httpSource('pkg')).then(function () {
-            sendReady();
-        }, function (error) {
-            post('error', { message: 'load: ' + String(error && error.message || error) });
+            instance.setAudio({ snapshot: function () { return { left: left, right: right }; } });
+            instance.load(WebWallGL.httpSource('pkg')).then(function () {
+                sendReady();
+                if (props && Object.keys(props).length) {
+                    try {
+                        instance.setProperties(props);
+                    } catch (error) {
+                        post('diag', { level: 'warn', message: 'props: ' + String(error && error.message || error) });
+                    }
+                }
+            }, function (error) {
+                post('error', { message: 'load: ' + String(error && error.message || error) });
+            });
+        };
+        // 先取用户属性再建场景：没有 applyUserProperties 钩子的场景在初始化时也能吃到值
+        fetch('props', { cache: 'no-store' }).then(function (response) {
+            return response.ok ? response.json() : {};
+        }).then(function (props) {
+            boot(props && typeof props === 'object' ? props : {});
+        }).catch(function (error) {
+            post('diag', { level: 'warn', message: 'props fetch failed: ' + String(error && error.message || error) });
+            boot({});
         });
     } catch (error) {
         post('error', { message: 'create: ' + String(error && error.message || error) });
@@ -935,6 +1034,8 @@ const startSceneServer = (item) => new Promise((resolve, reject) => {
     const token = crypto.randomBytes(16).toString('hex');
     const tokenPrefix = `/${token}`;
     const root = item.dir;
+    // 当前壁纸的用户属性值：渲染端每次 sceneFrame 时更新，host.html 自己来取
+    let currentProps = {};
     const enginePath = path.join(__dirname, 'vendor', 'webwallgl.global.min.js');
     const server = http.createServer(async (request, response) => {
         try {
@@ -950,6 +1051,16 @@ const startSceneServer = (item) => new Promise((resolve, reject) => {
                 return;
             }
             url.pathname = url.pathname.slice(tokenPrefix.length) || '/';
+            if (url.pathname === '/props') {
+                const body = Buffer.from(JSON.stringify(currentProps ?? {}), 'utf8');
+                response.writeHead(200, {
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'Content-Length': String(body.length),
+                    'Cache-Control': 'no-store',
+                });
+                response.end(request.method === 'HEAD' ? undefined : body);
+                return;
+            }
             if (url.pathname === '/host.html') {
                 const body = Buffer.from(SCENE_HOST, 'utf8');
                 response.writeHead(200, {
@@ -1325,6 +1436,8 @@ module.exports = function activate(api) {
                 absFile: item.absFile,
                 absPreview: item.absPreview,
                 tags: item.tags,
+                // WE 用户属性定义（场景壁纸才有）
+                properties: item.properties,
             })),
         };
     };
@@ -1428,6 +1541,9 @@ module.exports = function activate(api) {
             }
         }
         host.refs += 1;
+        if (typeof host.setProps === 'function') {
+            host.setProps(options?.props && typeof options.props === 'object' ? options.props : {});
+        }
         const query = new URLSearchParams({
             fit: String(options?.fit ?? 'cover'),
             fps: String(Math.max(15, Math.min(60, Number(options?.fps) || 30))),
